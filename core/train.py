@@ -89,11 +89,15 @@ def equalize_loss(model, y, x, P, S, ldbp=False):
 # generic training loop
 # --------------------------------------------------------------------------- #
 def _train_loop(model, S, tf, param_groups, iters, batch, P_dbm, n_blocks, seed,
-                ldbp=False, device='cuda', prune_events=None):
+                ldbp=False, device='cuda', prune_events=None, patience=3000):
     """prune_events: optional list of (iteration, step_index) -- at the given iteration,
     remove ONE outermost tap from that step (model.prune_one). Mirrors ldbp_diag.py:
     gradual one-tap-at-a-time pruning so the model adapts between prunes (pruning many
-    taps at once shocks the model to 0 dB)."""
+    taps at once shocks the model to 0 dB).
+    patience: EARLY STOP -- end training if the best val has not improved by more than
+    0.005 dB in the last `patience` iterations (never while prunes are pending, so a
+    post-prune recovery is not cut short). None disables. Motivation: flat tails were
+    burning hours (lessfm n2 Ns=300: 16602s with best frozen since iter 1000)."""
     ys, xs, P = gen_dualpol(tf, S, n_blocks, P_dbm, seed)
     yv, xv, _ = gen_dualpol(tf, S, max(8, n_blocks // 8), P_dbm, seed + 10000)
     Nex = ys.shape[0]
@@ -101,6 +105,7 @@ def _train_loop(model, S, tf, param_groups, iters, batch, P_dbm, n_blocks, seed,
     sch = torch.optim.lr_scheduler.CosineAnnealingLR(opt, T_max=iters)
     pend = list(prune_events) if prune_events else []
     best, bstate = 1e9, None
+    last_improve = 0
     t0 = time.time()
     for it in range(iters):
         while pend and it >= pend[0][0]:
@@ -119,12 +124,19 @@ def _train_loop(model, S, tf, param_groups, iters, batch, P_dbm, n_blocks, seed,
             # only checkpoint the best AFTER pruning is complete -- otherwise the best
             # is the pre-pruned (full-tap) model, which doesn't match the final masks.
             if not pend and vl < best:
+                if 10 * (np.log10(best) - np.log10(vl)) > 0.005 or bstate is None:
+                    last_improve = it                      # meaningful improvement
                 best = vl
                 bstate = {k: v.detach().clone() for k, v in model.state_dict().items()}
             if it % 1000 == 0:
                 tag = f" (pruning, {len(pend)} left)" if pend else ""
                 print(f"  iter {it}: val SNR {-10*np.log10(vl):.3f}  best "
                       f"{-10*np.log10(best) if best < 1e8 else float('nan'):.3f}{tag}", flush=True)
+            if (patience is not None and not pend and bstate is not None
+                    and it - last_improve >= patience):
+                print(f"  early stop at iter {it} (no val improvement in {patience} iters)",
+                      flush=True)
+                break
     if bstate is not None:
         model.load_state_dict(bstate)
     print(f"  trained in {time.time()-t0:.0f}s, best val SNR {-10*np.log10(best):.3f} dB", flush=True)
