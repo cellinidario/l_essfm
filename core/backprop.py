@@ -59,20 +59,31 @@ def load_params(S, bw, kind, params_path):
     return cd_mult, nlf
 
 
-def curve(S, data, Pgrid, kind, ns, params=None, edc=False):
-    """effSNR(P) averaged over realizations for one method."""
-    bw = make_bw(S, ns)
+def curve(S, data, Pgrid, kind, ns, params=None, edc=False, total_steps=None):
+    """effSNR(P) averaged over realizations for one method.
+
+    total_steps: passed to make_bw. None=auto (total-steps for multi-span). For the
+    IDEAL DBP / EDC reference on a multi-span link, pass total_steps=False so `ns`
+    means steps PER SPAN (Ideal needs an accurate per-span backprop, e.g. 50/span =
+    750 steps over 15 spans). Trained methods (L-ESSFM/ESSFM) keep total-steps (the
+    Fig.1b complexity convention: ns = TOTAL DBP steps)."""
+    bw = make_bw(S, ns, total_steps=total_steps)
     if kind == 'ossfm':
-        # optimize the single nonlinear scale on a small grid at the central powers
-        mid = sorted(data)[len(data) // 3: 2 * len(data) // 3 + 1]
-        best_scale, best = 1.0, -1e9
-        for scale in np.arange(0.4, 1.41, 0.1):
-            S['_ossfm_scale'] = scale
+        # Optimize the single nonlinear scale. The optimum is power-insensitive, so
+        # search at ONE central power (1 realization) -> ~11 backprops instead of
+        # ~70. Coarse 0.4..1.4 step 0.1, then a fine pass ±0.1 step 0.025.
+        Pmid = sorted(data)[len(data) // 2]
+        ymid, xmid = data[Pmid][0]
+        Pw = 10 ** (Pmid / 10) * 1e-3
+
+        def scale_snr(sc):
+            S['_ossfm_scale'] = sc
             cd_mult, nlf = load_params(S, bw, 'ossfm', None)
-            pk = max(backprop(S, bw, cd_mult, nlf, *data[Pdb][0], 10**(Pdb/10)*1e-3)
-                     for Pdb in mid)
-            if pk > best:
-                best, best_scale = pk, scale
+            return backprop(S, bw, cd_mult, nlf, ymid, xmid, Pw)
+        coarse = np.arange(0.0, 1.41, 0.1)
+        best_scale = max(coarse, key=scale_snr)
+        fine = np.arange(best_scale - 0.1, best_scale + 0.101, 0.025)
+        best_scale = max(fine, key=scale_snr)
         S['_ossfm_scale'] = best_scale
     cd_mult, nlf = load_params(S, bw, kind, params)
     snr = np.zeros(len(Pgrid))

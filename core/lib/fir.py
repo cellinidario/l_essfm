@@ -1,6 +1,7 @@
 import numpy as np
 from numpy import pi, cos, sin, exp, sqrt
-from scipy import special, linalg, optimize, ifft
+from scipy import special, linalg, optimize
+from numpy.fft import ifft
 import warnings
 #import sympy as sym
 
@@ -65,7 +66,7 @@ class cd_fir_filter:
 		
 		KK = -(self.beta2)/2*L*(self.fsamp**2)
 		delay = (cd_filter_length-1)//2
-		N = self.Nsamp
+		N = int(self.Nsamp)
 		xi = self.bandwidth
 		Omega1 = -pi*xi
 		Omega2 =  pi*xi
@@ -146,15 +147,17 @@ class cd_fir_filter:
 			nn = np.arange(-delay, delay+1)[np.newaxis].T
 			v = self.int_aux(nn, KK, xi)
 			
-			hopt = lambda l: linalg.solve(Q1+l*Q2, v)
+			hopt = lambda l: linalg.solve(Q1 + 1e-12*np.eye(cd_filter_length) + l*Q2, v)
 			fun2 = lambda l: out_of_band_gain(hopt(np.abs(l)))-self.max_out_of_band_gain
 			 
-			lambda_opt = np.abs(optimize.fsolve(fun2, 1e-10))
-			#if fun2(0.0) > 0:
-			#	lambda_opt = np.abs(optimize.fsolve(fun2, 0.0))
-			#else:
-			#	lambda_opt = 0.0
-			#print(lambda_opt)
+			if fun2(0.0) > 0:
+				res, info, ier, mesg = optimize.fsolve(fun2, 0.0, full_output=True)
+				if ier == 1:
+					lambda_opt = np.abs(res[0])
+				else:
+					lambda_opt = 0.0
+			else:
+				lambda_opt = 0.0
 			
 			cd_filter_coeffs = hopt(lambda_opt)
 		elif self.method == 'maximally flat': # experimental

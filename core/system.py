@@ -167,6 +167,11 @@ def build_system(cfg_path):
     S['combine'] = ce.getboolean('combine half-steps')
     S['StPS_fw'] = cg.getint('forward steps per span')
     S['step_method_fw'] = cg['forward step size method']; S['ssfm_method_fw'] = cg['forward split step method']
+    # training launch power [dBm] for this scenario (near its operating peak): the
+    # PyTorch trainer trains at this power. Searched across all sections; default 9.0.
+    S['train_power_dbm'] = next((float(cfg[sec]['training power [dbm]'])
+                                 for sec in cfg.sections()
+                                 if cfg.has_option(sec, 'training power [dbm]')), 9.0)
 
     alpha_lin = S['alpha'] / DB
     sef = 10.0**(S['noise_figure'] / 10.0) / 2.0
@@ -191,6 +196,7 @@ def build_system(cfg_path):
         "Nsp": 1, "Lsp": S['Lsp'], "fsamp": S['fsamp_a'], "Nsamp": S['Nsamp_a'],
         "step_size_method": S['step_method_fw'], "ssfm_method": S['ssfm_method_fw'],
         "StPS": S['StPS_fw'], "direction": 1})
+    S['cfg_path'] = cfg_path           # so trainers can rebuild with a larger block
     return S
 
 
@@ -202,7 +208,7 @@ def forward(S, P):
     else:
         x = (np.random.normal(0, 1, [Npol, Nch, Nsym]) + 1j * np.random.normal(0, 1, [Npol, Nch, Nsym])) / np.sqrt(2)
     x_up = np.zeros([Npol, Nch, Nsamp_a], dtype=np.complex64); x_up[:, :, ::OS_a] = x * np.sqrt(OS_a)
-    u = sp.ifft(sp.fft(x_up) * S['ps_tx_freq']) * np.sqrt(P / Npol)
+    u = np.fft.ifft(np.fft.fft(x_up) * S['ps_tx_freq']) * np.sqrt(P / Npol)
     u_wdm = np.zeros([Npol, Nsamp_a], dtype=np.complex64)
     for NN in range(Nch):
         fs = (NN - Nch // 2) * S['spacing']
@@ -210,41 +216,85 @@ def forward(S, P):
     for _ in range(S['Nsp']):
         u_wdm += np.sqrt(S['sigma2'] / 2) * (np.random.randn(1, Nsamp_a) + 1j * np.random.randn(1, Nsamp_a))
         for MM in range(S['fw'].model_steps):
-            u_wdm = sp.ifft(sp.fft(u_wdm) * np.exp(1j * S['fw'].get_cd_filter_freq(MM)))
+            u_wdm = np.fft.ifft(np.fft.fft(u_wdm) * np.exp(1j * S['fw'].get_cd_filter_freq(MM)))
             u_wdm *= np.exp(1j * S['fw'].nl_param[MM] * (np.abs(u_wdm[0, :])**2 + np.abs(u_wdm[1, :])**2))
-    y = sp.ifft(sp.fft(u_wdm) * S['lp_freq'])
+    y = np.fft.ifft(np.fft.fft(u_wdm) * S['lp_freq'])
     return y, x[:, Nch // 2, :]
 
 
-def make_bw(S, ns):
-    """Backprop SSFMParameters for ns steps."""
+def make_bw(S, ns, total_steps=None):
+    """Backprop SSFMParameters.
+
+    total_steps controls whether `ns` counts steps PER SPAN or over the WHOLE link:
+      - total_steps=False -> ns is steps PER SPAN (model_steps = Nsp*ns+1).
+      - total_steps=True  -> ns is TOTAL steps over the whole link (the convention
+        for the Fig.1b complexity axis: Ns=1..50 are total DBP steps, NOT ×Nsp).
+        Implemented as the 'less steps than spans' option: treat the link as ONE
+        span of length Nsp*Lsp with alpha=0 (attenuation is folded into nl_param)
+        and StPS=ns -> model_steps = ns+1, independent of the number of spans.
+      - total_steps=None (default) -> auto: total-steps mode when Nsp>1 (so multi-
+        span scenarios get the same complexity axis as single-span ones).
+    """
+    if total_steps is None:
+        total_steps = S['Nsp'] > 1
+    if total_steps:
+        # Dario's L-ESSFM convention (l-essfm_test.ipynb cell 13): keep alpha,
+        # map Nsp=ns (total steps), each "span" = Ltot/ns long, StPS=1 ->
+        # model_steps = ns+1, with the correct power profile (alpha NOT zeroed,
+        # unlike the Hager/ldbp_diag variant).
+        return SSFMParameters({'beta2': S['beta2'], 'gamma': S['gamma'], 'fsamp': S['fsamp_d'],
+            'Nsamp': S['Nsamp_d'], 'step_size_method': S['step_method_bw'], 'ssfm_method': S['ssfm_method_bw'],
+            'combine_half_steps': S['combine'], 'direction': -1, 'alpha': S['alpha'],
+            'Nsp': ns, 'Lsp': S['Lsp'] * S['Nsp'] / ns, 'StPS': 1})
     return SSFMParameters({'beta2': S['beta2'], 'gamma': S['gamma'], 'fsamp': S['fsamp_d'],
         'Nsamp': S['Nsamp_d'], 'step_size_method': S['step_method_bw'], 'ssfm_method': S['ssfm_method_bw'],
         'combine_half_steps': S['combine'], 'direction': -1, 'alpha': S['alpha'],
         'Nsp': S['Nsp'], 'Lsp': S['Lsp'], 'StPS': ns})
 
 
-def backprop(S, bw, cd_mult, nlf, y, x, P, edc=False):
-    """Apply DBP and return effSNR [dB]. cd_mult/nlf: per-step dicts."""
+# Optional GPU backend (CuPy) for the heavy backprop loop, like the original
+# l-essfm_test.ipynb. Falls back to numpy if CuPy is unavailable. The signal lives
+# on the GPU through the O(model_steps) CD+NLPR loop; only the light matched-filter
+# tail runs on the CPU (exactly the original's cp.asnumpy() handoff).
+try:
+    import cupy as _cp
+    _HAVE_CUPY = True
+except Exception:
+    _cp = np
+    _HAVE_CUPY = False
+
+
+def backprop(S, bw, cd_mult, nlf, y, x, P, edc=False, gpu=None):
+    """Apply DBP and return effSNR [dB]. cd_mult/nlf: per-step dicts.
+
+    gpu: True -> run the CD+NLPR loop on the GPU via CuPy (fast for the large
+    262144-symbol signals); None -> auto (GPU if CuPy present); False -> numpy.
+    """
+    use_gpu = (_HAVE_CUPY if gpu is None else gpu) and _HAVE_CUPY
+    xp = _cp if use_gpu else np
     Nsamp_d, OS_a, OS_d, Nsym, Npol = S['Nsamp_d'], S['OS_a'], S['OS_d'], S['Nsym'], S['Npol']
     cd_alpha, nl_alpha = S['cd_alpha'], S['nl_alpha']
-    Y = sp.fft(y); Y = Y[:, :Nsamp_d] + Y[:, -Nsamp_d:]; y = sp.ifft(Y) / OS_a * OS_d
+    y = xp.asarray(y)
+    Y = xp.fft.fft(y); Y = Y[:, :Nsamp_d] + Y[:, -Nsamp_d:]; y = xp.fft.ifft(Y) / OS_a * OS_d
     for NN in range(bw.model_steps):
-        y = sp.ifft(sp.fft(y) * np.exp(1j * bw.get_cd_filter_freq(NN) * cd_mult[NN] / cd_alpha))
+        cdf = xp.asarray(bw.get_cd_filter_freq(NN) * cd_mult[NN] / cd_alpha)
+        y = xp.fft.ifft(xp.fft.fft(y) * xp.exp(1j * cdf))
         if (NN < bw.model_steps - 1) and not edc:
-            ysq = np.abs(y[0, :])**2 + np.abs(y[1, :])**2
+            ysq = xp.abs(y[0, :])**2 + xp.abs(y[1, :])**2
             nfl = len(nlf[NN])
-            nl_time = -nlf[NN] / nl_alpha
+            nl_time = -np.asarray(nlf[NN]) / nl_alpha
             nl_time = np.concatenate([np.flip(nl_time[1:]), nl_time, np.zeros(Nsamp_d - 2 * nfl + 1)])
             nl_time = np.roll(nl_time, -nfl + 1)
-            ysqf = np.fft.irfft(np.fft.rfft(ysq) * np.fft.rfft(nl_time))
-            y = y * np.exp(1j * ysqf)
-    Y = sp.fft(y) * S['ps_rx_freq']
+            ysqf = xp.fft.irfft(xp.fft.rfft(ysq) * xp.fft.rfft(xp.asarray(nl_time)))
+            y = y * xp.exp(1j * ysqf)
+    # matched-filter tail + CPE on the CPU (light), as in the original
+    y = _cp.asnumpy(y) if use_gpu else y
+    Y = np.fft.fft(y) * S['ps_rx_freq']
     Yal = Y[:, :Nsym].copy()
     Yal[:, Nsym - Nsamp_d // 2:Nsym // 2] += Y[:, Nsamp_d // 2:Nsamp_d - Nsym // 2]
     Yal[:, Nsym // 2:Nsamp_d // 2] += Y[:, Nsamp_d - Nsym // 2:3 * Nsamp_d // 2 - Nsym]
     Yal[:, Nsamp_d // 2:Nsym] = Y[:, 3 * Nsamp_d // 2 - Nsym:]
-    y = sp.ifft(Yal) / OS_d / np.sqrt(P / Npol) / np.sqrt(OS_d)
+    y = np.fft.ifft(Yal) / OS_d / np.sqrt(P / Npol) / np.sqrt(OS_d)
     x_hat = np.zeros([Npol, Nsym], dtype=np.complex64)
     for pp in range(Npol):
         phi = np.angle(np.dot(np.conj(x[pp, :]), y[pp, :]))

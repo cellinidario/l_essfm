@@ -31,8 +31,13 @@ from system import build_system, make_bw, SSFMParameters, qam_constellation
 
 def _exp_length_mult(S, bw, ns):
     """Exponential GVD-length init (backward equal-NL power profile), as in TF1.
-    Returns multipliers of the nominal cd_length (sum -> Ns, halved borders)."""
-    Lsp = S['Lsp']; Nsp = S['Nsp']
+    Returns multipliers of the nominal cd_length (sum -> Ns, halved borders).
+
+    Uses the BACKPROP geometry from `bw` (bw.Nsp, bw.Lsp, bw.StPS) so it is correct
+    for BOTH per-span and total-steps conventions. With total-steps, bw maps the
+    link to bw.Nsp 'spans' of length bw.Lsp with StPS=1 -> the exp profile is built
+    on that geometry (NOT the original S['Nsp']/S['Lsp'], which would mismatch)."""
+    Lsp = bw.Lsp; Nsp = bw.Nsp; sps = bw.StPS
     alpha_l = S['alpha'] / (10 * np.log10(np.e)) / 1000.0   # 1/m
 
     def span_steps(Nstep):
@@ -41,7 +46,7 @@ def _exp_length_mult(S, bw, ns):
             z.append(-np.log(1 - (i / Nstep) * (1 - np.exp(-alpha_l * Lsp))) / alpha_l)
         z.append(Lsp)
         return np.diff(z)[::-1]
-    steps_phys = np.concatenate([span_steps(ns) for _ in range(Nsp)])
+    steps_phys = np.concatenate([span_steps(sps) for _ in range(Nsp)])
     M = bw.model_steps
     cd_phys = np.zeros(M)
     cd_phys[0] = steps_phys[0] / 2
@@ -54,7 +59,7 @@ def _exp_length_mult(S, bw, ns):
 class LessfmModel(torch.nn.Module):
     """L-ESSFM (free lengths + per-step NLPR) or ESSFM (uniform + rho + tied NLPR)."""
 
-    def __init__(self, S, ns, device, tied_kerr=False, opt_rho=False):
+    def __init__(self, S, ns, device, tied_kerr=False, opt_rho=False, nonneg=False):
         super().__init__()
         self.S = S
         self.bw = make_bw(S, ns)
@@ -63,6 +68,7 @@ class LessfmModel(torch.nn.Module):
         self.ns = ns
         self.tied_kerr = tied_kerr
         self.opt_rho = opt_rho
+        self.nonneg = nonneg          # constrain GVD lengths >=0 (softmax param)
         self.dev = device
 
         # fixed per-step GVD phase = get_cd_filter_freq(NN) (includes cd_length[NN]).
@@ -75,10 +81,26 @@ class LessfmModel(torch.nn.Module):
         if opt_rho:                                   # ESSFM: one shared rho
             self.rho = torch.nn.Parameter(torch.tensor([0.5], device=device))
         else:
-            init = _exp_length_mult(S, self.bw, ns)   # L-ESSFM: free, exp-init
-            self.length = torch.nn.Parameter(torch.tensor(init, device=device))
+            # L-ESSFM: the FIRST M-1 steps are free trainable multipliers; the LAST
+            # step is DERIVED so the total dispersion (sum with halved borders) stays
+            # fixed at target_sum. This matches TF1 (lessfm.py L691-703) and is the
+            # key to a well-conditioned problem: the lengths can redistribute (front-
+            # load step 0) while the total CD budget is preserved. Training all M
+            # freely (no constraint) lets the sum drift -> stuck at init or diverges.
+            init = _exp_length_mult(S, self.bw, ns)   # length [M] (exp-init, halved borders)
+            self.target_sum = float(init[0] / 2 + init[1:-1].sum() + init[-1] / 2)
+            if nonneg:
+                # softmax over M params (init from the exp profile via log) -> the
+                # length_mult() softmax reproduces the exp init and stays >=0.
+                self.length = torch.nn.Parameter(torch.log(torch.tensor(init, device=device).clamp_min(1e-3)))
+            else:
+                self.length = torch.nn.Parameter(torch.tensor(init[:-1], device=device))  # free: [M-1]
 
-        # trainable NLPR filters (one-sided), init delta
+        # trainable NLPR filters (one-sided), init UNIT DELTA in time -- matches TF1.
+        # TF1 stores no_filter[0] = nl_alpha and applies -nlf*nl_step_scale/nl_alpha,
+        # so for L-ESSFM (nl_step_scale=1) the PHYSICAL initial filter is a unit delta.
+        # We carry no nl_alpha (per-group lr replaces it), so we store the physical
+        # delta directly: no[0] = 1.0.
         no = np.zeros(self.nfl, dtype=np.float32); no[0] = 1.0
         if tied_kerr:
             self.nlf = torch.nn.Parameter(torch.tensor(no, device=device))         # [nfl]
@@ -103,7 +125,22 @@ class LessfmModel(torch.nn.Module):
             mult[0] = 2.0 * r.squeeze()
             mult[-1] = 2.0 * (1.0 - r.squeeze())
             return mult
-        return self.length
+        if getattr(self, 'nonneg', False):
+            # Non-negative GVD lengths with fixed total dispersion: softmax over all
+            # M params -> positive fractions summing to 1, scaled so the halved-border
+            # sum equals target_sum. Border weight 1/2 folded into the budget. Keeps
+            # lengths >=0 (physical: GVD steps are distances) and the CD budget fixed.
+            w = torch.softmax(self.length, dim=0)        # [M], >0, sums to 1
+            # halved-border effective sum = w[0]/2 + w[1:-1].sum() + w[-1]/2 = 1 - (w[0]+w[-1])/2
+            eff = 1.0 - (w[0] + w[-1]) / 2
+            return w * (self.target_sum / eff)
+        # free first M-1 multipliers; derive the last to keep the dispersion sum
+        # (halved borders) fixed at target_sum (matches TF1 L694-703):
+        #   cd_sum = length[0]/2 + sum(length[1:M-1]);  last = 2*(target_sum - cd_sum)
+        free = self.length                              # [M-1]
+        cd_sum = free[0] / 2 + free[1:].sum()
+        last = 2.0 * (self.target_sum - cd_sum)
+        return torch.cat([free, last.reshape(1)])
 
     def _nlf_padded_fft(self, NN):
         """rfft of the padded/mirrored NLPR filter for step NN."""
@@ -129,19 +166,24 @@ class LessfmModel(torch.nn.Module):
            - test/eval (dual-pol jointly): y is [Npol, N, 2] and the NLPR uses the
              TOTAL power over polarizations -> pass pol_dim=0 so ysq sums over pol.
         """
+        # Cache nonlinear filter FFTs during evaluation to save huge CPU/GPU time
+        if not self.training:
+            if getattr(self, '_cached_nlf_fft', None) is None:
+                self._cached_nlf_fft = [self._nlf_padded_fft(nn) for nn in range(self.M - 1)]
+        else:
+            self._cached_nlf_fft = None
+
         lm = self.length_mult()
+        yc = torch.complex(y[..., 0], y[..., 1])
         for NN in range(self.M):
-            yc = torch.complex(y[..., 0], y[..., 1])
             phase = self.cd_base[NN] * lm[NN] / self.cd_alpha
             yc = torch.fft.ifft(torch.fft.fft(yc) * torch.exp(1j * phase))
-            y = torch.stack([yc.real, yc.imag], -1)
             if NN < self.M - 1:
-                ysq = (y ** 2).sum(-1)                       # |y|^2 per signal
+                ysq = yc.abs() ** 2                          # |y|^2 per signal
                 if pol_dim is not None:
                     ysq = ysq.sum(pol_dim, keepdim=True)     # total power over pols
-                theta = torch.fft.irfft(torch.fft.rfft(ysq) * self._nlf_padded_fft(NN),
-                                        n=self.Nsamp_d)
-                c, s = torch.cos(theta), torch.sin(theta)
-                y = torch.stack([y[..., 0] * c - y[..., 1] * s,
-                                 y[..., 0] * s + y[..., 1] * c], -1)
-        return torch.complex(y[..., 0], y[..., 1])
+                
+                nlf_fft = self._cached_nlf_fft[NN] if not self.training else self._nlf_padded_fft(NN)
+                theta = torch.fft.irfft(torch.fft.rfft(ysq) * nlf_fft, n=self.Nsamp_d)
+                yc = yc * torch.exp(1j * theta)
+        return yc
