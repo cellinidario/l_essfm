@@ -89,15 +89,18 @@ def equalize_loss(model, y, x, P, S, ldbp=False):
 # generic training loop
 # --------------------------------------------------------------------------- #
 def _train_loop(model, S, tf, param_groups, iters, batch, P_dbm, n_blocks, seed,
-                ldbp=False, device='cuda', prune_events=None, patience=3000):
+                ldbp=False, device='cuda', prune_events=None, early_stop=True):
     """prune_events: optional list of (iteration, step_index) -- at the given iteration,
     remove ONE outermost tap from that step (model.prune_one). Mirrors ldbp_diag.py:
     gradual one-tap-at-a-time pruning so the model adapts between prunes (pruning many
     taps at once shocks the model to 0 dB).
-    patience: EARLY STOP -- end training if the best val has not improved by more than
-    0.005 dB in the last `patience` iterations (never while prunes are pending, so a
-    post-prune recovery is not cut short). None disables. Motivation: flat tails were
-    burning hours (lessfm n2 Ns=300: 16602s with best frozen since iter 1000)."""
+    Early stop (Dario's criterion): at each 1000-iter checkpoint, stop if the val SNR
+    moved by STRICTLY less than 0.001 dB (in either direction) since the previous
+    checkpoint. Applies also during pruning: a healthy pruning run moves far more
+    than that between checkpoints, and one that doesn't is dead anyway. On the
+    measured logs: flat ESSFM stops early (was burning hours, e.g. 16602s with best
+    frozen since iter 1000), while the slow steady LDBP tail (+0.007..0.03 dB/1000)
+    is never cut."""
     ys, xs, P = gen_dualpol(tf, S, n_blocks, P_dbm, seed)
     yv, xv, _ = gen_dualpol(tf, S, max(8, n_blocks // 8), P_dbm, seed + 10000)
     Nex = ys.shape[0]
@@ -105,7 +108,7 @@ def _train_loop(model, S, tf, param_groups, iters, batch, P_dbm, n_blocks, seed,
     sch = torch.optim.lr_scheduler.CosineAnnealingLR(opt, T_max=iters)
     pend = list(prune_events) if prune_events else []
     best, bstate = 1e9, None
-    last_improve = 0
+    prev_ckpt = None                           # val SNR [dB] at the previous checkpoint
     t0 = time.time()
     for it in range(iters):
         while pend and it >= pend[0][0]:
@@ -124,19 +127,19 @@ def _train_loop(model, S, tf, param_groups, iters, batch, P_dbm, n_blocks, seed,
             # only checkpoint the best AFTER pruning is complete -- otherwise the best
             # is the pre-pruned (full-tap) model, which doesn't match the final masks.
             if not pend and vl < best:
-                if 10 * (np.log10(best) - np.log10(vl)) > 0.005 or bstate is None:
-                    last_improve = it                      # meaningful improvement
                 best = vl
                 bstate = {k: v.detach().clone() for k, v in model.state_dict().items()}
             if it % 1000 == 0:
                 tag = f" (pruning, {len(pend)} left)" if pend else ""
-                print(f"  iter {it}: val SNR {-10*np.log10(vl):.3f}  best "
+                snr_db = -10 * np.log10(vl)
+                print(f"  iter {it}: val SNR {snr_db:.3f}  best "
                       f"{-10*np.log10(best) if best < 1e8 else float('nan'):.3f}{tag}", flush=True)
-            if (patience is not None and not pend and bstate is not None
-                    and it - last_improve >= patience):
-                print(f"  early stop at iter {it} (no val improvement in {patience} iters)",
-                      flush=True)
-                break
+                if (early_stop and prev_ckpt is not None
+                        and abs(snr_db - prev_ckpt) < 0.001):
+                    print(f"  early stop at iter {it} (val moved "
+                          f"{snr_db - prev_ckpt:+.4f} dB since last checkpoint)", flush=True)
+                    break
+                prev_ckpt = snr_db
     if bstate is not None:
         model.load_state_dict(bstate)
     print(f"  trained in {time.time()-t0:.0f}s, best val SNR {-10*np.log10(best):.3f} dB", flush=True)
@@ -152,19 +155,28 @@ def _power(S, P_dbm):
     return S.get('train_power_dbm', 9.0) if P_dbm is None else P_dbm
 
 
-def nlpr_length(S, ns):
-    """One-sided NLPR filter length from the MATLAB essfmNc formula (Civelli,
-    test_ccessfm.m / DSP.m): Nc = round(pi*(L_tot/ns)*|b2|*(R*n)^2/2)+2, length=Nc+1.
-    Sized on the PER-STEP memory L_tot/ns -- shrinks as Ns grows. Used for BOTH
-    ESSFM and L-ESSFM (Dario, June 2026). Examples: 01 Ns=1 -> 66 (historical),
-    03 Ns=1 -> 450 (+0.06 vs fixed 66), 03 Ns=10 -> 48.
-    Measured caveat (03 Ns=10): the longest LEARNED step can exceed L_tot/ns (e.g.
-    1.34x with nonneg) -> per-step sizing loses ~0.05 vs 66 there; pass nfl= to
-    override in experiments."""
+def _essfm_nc(S, ns):
+    """MATLAB essfmNc formula (Civelli, test_ccessfm.m / DSP.m), one-sided filter
+    length Nc+1 = round(pi*(L_tot/ns)*|b2|*(R*n)^2/2)+3. Per-step (~L_tot/ns)."""
     LL = S['Lsp'] * S['Nsp']
     nc = max(round(np.pi * LL * abs(S['beta2']) / max(int(ns), 1)
                    * (S['fsym'] * S['OS_d']) ** 2 / 2), 1) + 2
     return int(nc) + 1
+
+
+def nlpr_length(S, ns, method='lessfm'):
+    """One-sided NLPR filter length.
+    ESSFM (uniform steps): pure per-step formula `_essfm_nc(Ns)` (shrinks with Ns).
+    L-ESSFM (Dario's OFC convention): the GVD step lengths are LEARNED and the first
+    step stays ~the whole fiber even at moderate Ns, so the NLPR kernel must stay
+    long. Keep the Ns=1 value (full link) FIXED up to Ns=10, then follow the formula.
+    This removes the saw-tooth dips seen at 02 Ns=4,7 where the per-step formula
+    under-sizes the filter (66/39 taps instead of the 257 the long first step wants).
+    Examples (n=1.125): 01 -> 66 up to Ns=10; 02 -> 257; 03 -> 450; all then the
+    per-step formula for Ns>10 (cap is well above the operating range)."""
+    if method == 'essfm':
+        return _essfm_nc(S, ns)
+    return _essfm_nc(S, 1) if int(ns) <= 10 else _essfm_nc(S, ns)
 
 
 def _ensure_block(S, nfl):
@@ -205,7 +217,7 @@ def train_lessfm(S, ns, out, device='cuda', iters=12000, batch=200, P_dbm=None,
 def train_essfm(S, ns, out, device='cuda', iters=12000, batch=200, P_dbm=None,
                 lr_rho=0.01, lr_nlf=0.002, n_blocks=250, seed=0, nfl=None):
     S = dict(S)
-    S['nl_filter_length'] = nlpr_length(S, ns) if nfl is None else nfl
+    S['nl_filter_length'] = nlpr_length(S, ns, method='essfm') if nfl is None else nfl
     S = dict(_ensure_block(S, S['nl_filter_length']), nl_filter_length=S['nl_filter_length'])
     tf = TorchForward(S, device)
     m = LessfmModel(S, ns, device, tied_kerr=True, opt_rho=True).to(device)
