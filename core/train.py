@@ -196,15 +196,24 @@ def nlpr_length(S, ns, method='lessfm'):
     """One-sided NLPR filter length.
     ESSFM (uniform steps): pure per-step formula `_essfm_nc(Ns)` (shrinks with Ns).
     L-ESSFM (Dario's OFC convention): the GVD step lengths are LEARNED and the first
-    step stays ~the whole fiber even at moderate Ns, so the NLPR kernel must stay
-    long. Keep the Ns=1 value (full link) FIXED up to Ns=10, then follow the formula.
-    This removes the saw-tooth dips seen at 02 Ns=4,7 where the per-step formula
-    under-sizes the filter (66/39 taps instead of the 257 the long first step wants).
-    Examples (n=1.125): 01 -> 66 up to Ns=10; 02 -> 257; 03 -> 450; all then the
-    per-step formula for Ns>10 (cap is well above the operating range)."""
+    step stays ~the whole fiber even at moderate StPS, so the NLPR kernel must stay
+    long. The freeze must be on STEPS-PER-SPAN (StPS = ns/Nsp), NOT total steps:
+    keep the StPS=1 value (= _essfm_nc at one step per span) FIXED while 1 <= StPS
+    <= 10, then follow the per-step formula. Below StPS=1 ("less steps than spans")
+    each step spans MORE than one span -> longer kernel -> use the formula directly.
+    For single-span scenarios (Nsp=1) StPS==ns, so this reduces to "freeze ns<=10",
+    matching 01/02 (66 / 257) unchanged. On 03 (Nsp=15) the frozen value is
+    _essfm_nc(StPS=1)=_essfm_nc(15)=33 (n=1.125) / 97 (n=2), held for Ns=15..150,
+    then the formula for Ns=300,450 -- NOT the old buggy ns<=10 (which froze the
+    full-link 450 and under-sized everything from Ns=30 on)."""
     if method == 'essfm':
         return _essfm_nc(S, ns)
-    return _essfm_nc(S, 1) if int(ns) <= 10 else _essfm_nc(S, ns)
+    Nsp = S['Nsp']
+    if ns < Nsp:                       # StPS < 1: step spans > one span -> formula (long)
+        return _essfm_nc(S, ns)
+    if ns <= 10 * Nsp:                 # 1 <= StPS <= 10: freeze the StPS=1 value
+        return _essfm_nc(S, Nsp)
+    return _essfm_nc(S, ns)            # StPS > 10: per-step formula
 
 
 def _ensure_block(S, nfl):
