@@ -223,33 +223,49 @@ def forward(S, P):
 
 
 def make_bw(S, ns, total_steps=None):
-    """Backprop SSFMParameters.
+    """Backprop SSFMParameters. `ns` is always the TOTAL number of DBP steps over the
+    whole link (the Fig.1b complexity axis). Internally we follow Stella's convention
+    and think in steps-per-span (StPS = ns / Nsp):
 
-    total_steps controls whether `ns` counts steps PER SPAN or over the WHOLE link:
-      - total_steps=False -> ns is steps PER SPAN (model_steps = Nsp*ns+1).
-      - total_steps=True  -> ns is TOTAL steps over the whole link (the convention
-        for the Fig.1b complexity axis: Ns=1..50 are total DBP steps, NOT ×Nsp).
-        Implemented as the 'less steps than spans' option: treat the link as ONE
-        span of length Nsp*Lsp with alpha=0 (attenuation is folded into nl_param)
-        and StPS=ns -> model_steps = ns+1, independent of the number of spans.
-      - total_steps=None (default) -> auto: total-steps mode when Nsp>1 (so multi-
-        span scenarios get the same complexity axis as single-span ones).
+      - StPS >= 1 (ns is a multiple of Nsp): keep the Nsp REAL spans with StPS=ns/Nsp
+        integer steps each. This preserves the intra-span exp(alpha*z) power profile
+        (each span has one real EDFA), so nl_param carries Stella's xi profile. For
+        single-span scenarios (Nsp=1) this is just StPS=ns -- 01/02 unchanged.
+
+      - StPS < 1 (ns < Nsp, "less steps than spans") OR ns not a multiple of Nsp:
+        cannot place an integer number of steps per real span, so fall back to the
+        'one long effective span' mapping (Nsp_eff=ns, Lsp_eff=Ltot/ns, StPS=1),
+        keeping alpha (attenuation in the power profile, NOT zeroed). model_steps=ns+1.
+
+    total_steps overrides the auto choice (True -> long-span mapping; False -> per-span
+    with StPS=ns treated as steps PER SPAN, the raw SSFMParameters convention). Default
+    None -> auto per the StPS rule above.
+
+    PHYSICS: the long-span mapping spreads the Kerr UNIFORMLY across steps (fictitious
+    amplifiers every Ltot/ns km), which is correct only when ns<=Nsp. For ns>Nsp it
+    breaks the intra-span profile and costs ESSFM ~0.2 dB at high Ns -- hence the
+    per-span branch. See memory essfm-highns-plateau-bug.
     """
+    Nsp = S['Nsp']
     if total_steps is None:
-        total_steps = S['Nsp'] > 1
-    if total_steps:
-        # Dario's L-ESSFM convention (l-essfm_test.ipynb cell 13): keep alpha,
-        # map Nsp=ns (total steps), each "span" = Ltot/ns long, StPS=1 ->
-        # model_steps = ns+1, with the correct power profile (alpha NOT zeroed,
-        # unlike the Hager/ldbp_diag variant).
-        return SSFMParameters({'beta2': S['beta2'], 'gamma': S['gamma'], 'fsamp': S['fsamp_d'],
-            'Nsamp': S['Nsamp_d'], 'step_size_method': S['step_method_bw'], 'ssfm_method': S['ssfm_method_bw'],
-            'combine_half_steps': S['combine'], 'direction': -1, 'alpha': S['alpha'],
-            'Nsp': ns, 'Lsp': S['Lsp'] * S['Nsp'] / ns, 'StPS': 1})
-    return SSFMParameters({'beta2': S['beta2'], 'gamma': S['gamma'], 'fsamp': S['fsamp_d'],
-        'Nsamp': S['Nsamp_d'], 'step_size_method': S['step_method_bw'], 'ssfm_method': S['ssfm_method_bw'],
-        'combine_half_steps': S['combine'], 'direction': -1, 'alpha': S['alpha'],
-        'Nsp': S['Nsp'], 'Lsp': S['Lsp'], 'StPS': ns})
+        # per-span mode when an integer number of steps fits each real span; otherwise
+        # the long-span 'less steps than spans' mapping.
+        use_per_span = (ns >= Nsp) and (ns % Nsp == 0)
+    elif total_steps is False:
+        use_per_span = True      # ns interpreted as steps PER SPAN (raw convention)
+    else:
+        use_per_span = False     # forced long-span mapping
+    common = {'beta2': S['beta2'], 'gamma': S['gamma'], 'fsamp': S['fsamp_d'],
+        'Nsamp': S['Nsamp_d'], 'step_size_method': S['step_method_bw'],
+        'ssfm_method': S['ssfm_method_bw'], 'combine_half_steps': S['combine'],
+        'direction': -1, 'alpha': S['alpha']}
+    if use_per_span:
+        # StPS per real span. total_steps=False keeps the legacy meaning (ns=StPS);
+        # auto/None passes ns total -> StPS=ns//Nsp.
+        StPS = ns if total_steps is False else ns // Nsp
+        return SSFMParameters({**common, 'Nsp': Nsp, 'Lsp': S['Lsp'], 'StPS': StPS})
+    # long-span mapping (ns < Nsp or non-divisible): Nsp_eff=ns spans of Ltot/ns, StPS=1
+    return SSFMParameters({**common, 'Nsp': ns, 'Lsp': S['Lsp'] * Nsp / ns, 'StPS': 1})
 
 
 # Optional GPU backend (CuPy) for the heavy backprop loop, like the original
