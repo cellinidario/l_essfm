@@ -88,12 +88,37 @@ def equalize_loss(model, y, x, P, S, ldbp=False):
 # --------------------------------------------------------------------------- #
 # generic training loop
 # --------------------------------------------------------------------------- #
+# --------------------------------------------------------------------------- #
+# training-forward cache: the forward data-gen for a multi-span scenario (15 spans
+# x ~100 fwd steps = 1500 SSFM steps) is ~15x heavier than single-span and was being
+# regenerated for EVERY Ns. The generated blocks depend only on (block size Nsym,
+# train power, n_blocks, seed) -- NOT on Ns or the model -- so cache them and reuse
+# across all Ns sharing the same block size. Cuts sc03 data-gen from ~30 regens to
+# ~2 (one per distinct block size: 1024 and the doubled 2048).
+_FWD_CACHE = {}
+def train_forward(tf, S, n_blocks, P_dbm, seed):
+    """Return (ys, xs, yv, xv, P), generating once and caching by block size+power."""
+    key = (S['Nsym'], S['Nsamp_d'], round(float(P_dbm), 4), n_blocks, seed, S['Npol'])
+    if key not in _FWD_CACHE:
+        ys, xs, P = gen_dualpol(tf, S, n_blocks, P_dbm, seed)
+        yv, xv, _ = gen_dualpol(tf, S, max(8, n_blocks // 8), P_dbm, seed + 10000)
+        _FWD_CACHE[key] = (ys, xs, yv, xv, P)
+    return _FWD_CACHE[key]
+
+
+def clear_forward_cache():
+    """Free the cached training forwards (e.g. before switching scenario/oversampling)."""
+    _FWD_CACHE.clear()
+
+
 def _train_loop(model, S, tf, param_groups, iters, batch, P_dbm, n_blocks, seed,
-                ldbp=False, device='cuda', prune_events=None, early_stop=True):
+                ldbp=False, device='cuda', prune_events=None, early_stop=True, data=None):
     """prune_events: optional list of (iteration, step_index) -- at the given iteration,
     remove ONE outermost tap from that step (model.prune_one). Mirrors ldbp_diag.py:
     gradual one-tap-at-a-time pruning so the model adapts between prunes (pruning many
     taps at once shocks the model to 0 dB).
+    data: optional pre-generated (ys, xs, yv, xv, P) -- skips the forward data-gen
+    (reused across Ns with the same block size; see train_forward).
     Early stop (Dario's criterion): at each 1000-iter checkpoint, stop if the val SNR
     moved by STRICTLY less than 0.001 dB (in either direction) since the previous
     checkpoint. Applies also during pruning: a healthy pruning run moves far more
@@ -101,8 +126,11 @@ def _train_loop(model, S, tf, param_groups, iters, batch, P_dbm, n_blocks, seed,
     measured logs: flat ESSFM stops early (was burning hours, e.g. 16602s with best
     frozen since iter 1000), while the slow steady LDBP tail (+0.007..0.03 dB/1000)
     is never cut."""
-    ys, xs, P = gen_dualpol(tf, S, n_blocks, P_dbm, seed)
-    yv, xv, _ = gen_dualpol(tf, S, max(8, n_blocks // 8), P_dbm, seed + 10000)
+    if data is not None:
+        ys, xs, yv, xv, P = data
+    else:
+        ys, xs, P = gen_dualpol(tf, S, n_blocks, P_dbm, seed)
+        yv, xv, _ = gen_dualpol(tf, S, max(8, n_blocks // 8), P_dbm, seed + 10000)
     Nex = ys.shape[0]
     opt = torch.optim.Adam(param_groups)
     sch = torch.optim.lr_scheduler.CosineAnnealingLR(opt, T_max=iters)
@@ -209,7 +237,8 @@ def train_lessfm(S, ns, out, device='cuda', iters=12000, batch=200, P_dbm=None,
     tf = TorchForward(S, device)
     m = LessfmModel(S, ns, device, nonneg=nonneg).to(device)
     groups = [{'params': [m.length], 'lr': lr_len}, {'params': [m.nlf], 'lr': lr_nlf}]
-    _train_loop(m, S, tf, groups, iters, batch, _power(S, P_dbm), n_blocks, seed)
+    data = train_forward(tf, S, n_blocks, _power(S, P_dbm), seed)
+    _train_loop(m, S, tf, groups, iters, batch, _power(S, P_dbm), n_blocks, seed, data=data)
     save_params(out, m); print(f"  saved {out} (nfl={S['nl_filter_length']})")
     return m
 
@@ -222,7 +251,8 @@ def train_essfm(S, ns, out, device='cuda', iters=12000, batch=200, P_dbm=None,
     tf = TorchForward(S, device)
     m = LessfmModel(S, ns, device, tied_kerr=True, opt_rho=True).to(device)
     groups = [{'params': [m.rho], 'lr': lr_rho}, {'params': [m.nlf], 'lr': lr_nlf}]
-    _train_loop(m, S, tf, groups, iters, batch, _power(S, P_dbm), n_blocks, seed)
+    data = train_forward(tf, S, n_blocks, _power(S, P_dbm), seed)
+    _train_loop(m, S, tf, groups, iters, batch, _power(S, P_dbm), n_blocks, seed, data=data)
     save_params(out, m); print(f"  saved {out} (nfl={S['nl_filter_length']})")
     return m
 
