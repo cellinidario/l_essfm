@@ -253,16 +253,27 @@ def train_lessfm(S, ns, out, device='cuda', iters=12000, batch=200, P_dbm=None,
 
 
 def train_essfm(S, ns, out, device='cuda', iters=12000, batch=200, P_dbm=None,
-                lr_rho=0.01, lr_nlf=0.002, n_blocks=250, seed=0, nfl=None):
+                lr_rho=0.01, lr_nlf=0.002, n_blocks=250, seed=0, nfl=None, opt_rho=False):
+    """ESSFM = the reference single-band method (Civelli "New Twist", Fig.9):
+    'CB-ESSFM with Nsb=1 and rho=0.5'. So rho is FIXED at 0.5, NOT optimized -- only
+    the tied NLPR filter is trained. Optimizing rho (opt_rho=True) makes our ESSFM
+    ~0.37 dB too strong vs the paper (Ns=15: 18.46 vs 18.10) and erases the L-ESSFM
+    gain. Verified: rho=0.5 -> 18.095, matching paper 18.10. Set opt_rho=True only to
+    deliberately study the rho-optimized variant."""
     S = dict(S)
     S['nl_filter_length'] = nlpr_length(S, ns, method='essfm') if nfl is None else nfl
     S = dict(_ensure_block(S, S['nl_filter_length']), nl_filter_length=S['nl_filter_length'])
     tf = TorchForward(S, device)
+    # opt_rho=True keeps the tied-filter + uniform-GVD structure; we freeze rho at 0.5
+    # by leaving m.rho out of the optimizer groups (the paper's ESSFM definition).
     m = LessfmModel(S, ns, device, tied_kerr=True, opt_rho=True).to(device)
-    groups = [{'params': [m.rho], 'lr': lr_rho}, {'params': [m.nlf], 'lr': lr_nlf}]
+    groups = [{'params': [m.nlf], 'lr': lr_nlf}]
+    if opt_rho:
+        groups.insert(0, {'params': [m.rho], 'lr': lr_rho})
     data = train_forward(tf, S, n_blocks, _power(S, P_dbm), seed)
     _train_loop(m, S, tf, groups, iters, batch, _power(S, P_dbm), n_blocks, seed, data=data)
-    save_params(out, m); print(f"  saved {out} (nfl={S['nl_filter_length']})")
+    save_params(out, m); print(f"  saved {out} (nfl={S['nl_filter_length']}, "
+                               f"rho={'opt' if opt_rho else '0.5 fixed'})")
     return m
 
 
