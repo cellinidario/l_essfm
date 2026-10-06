@@ -66,6 +66,16 @@ class TorchForward:
         # WDM comb -> [B, Npol, Nsamp_a]
         u_wdm = (u * self.carrier).sum(2)
         for _ in range(self.Nsp):
+            # TRAINING-DATA ASE, deliberately left as in June 2026: one field drawn
+            # with shape (B, 1, N) and broadcast, i.e. the SAME noise on both
+            # polarisations. Drawing an independent field per polarisation is the
+            # physically correct choice and core/system.py does so, but on
+            # 2026-10-06 it was measured to give WORSE models on 15 x 80 km / 93 GBd:
+            # Ns=15 retrained on independent noise 18.311 dB vs 18.427 (June) and
+            # 18.429 (same code, this correlated draw), and the June model stays
+            # ahead when both are evaluated on independent-noise data (18.484 vs
+            # 18.373). Single span and 10 GBd were unaffected. Until that is
+            # understood, train as before; see memory project-geometry-and-ase-fixes.
             u_wdm = u_wdm + np.sqrt(self.sigma2 / 2) * (
                 torch.randn(B, 1, self.Nsamp_a, device=dev)
                 + 1j * torch.randn(B, 1, self.Nsamp_a, device=dev)).to(torch.complex64)

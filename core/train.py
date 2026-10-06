@@ -121,8 +121,9 @@ def _train_loop(model, S, tf, param_groups, iters, batch, P_dbm, n_blocks, seed,
     (reused across Ns with the same block size; see train_forward).
     Early stop (Dario's criterion): at each 1000-iter checkpoint, stop if the val SNR
     moved by STRICTLY less than 0.001 dB (in either direction) since the previous
-    checkpoint. Applies also during pruning: a healthy pruning run moves far more
-    than that between checkpoints, and one that doesn't is dead anyway. On the
+    checkpoint. NOT armed while pruning is still pending: `best` is only recorded
+    once the masks are final, so an early stop mid-pruning would leave bstate None
+    and save a model with more taps than the target. On the
     measured logs: flat ESSFM stops early (was burning hours, e.g. 16602s with best
     frozen since iter 1000), while the slow steady LDBP tail (+0.007..0.03 dB/1000)
     is never cut."""
@@ -162,7 +163,12 @@ def _train_loop(model, S, tf, param_groups, iters, batch, P_dbm, n_blocks, seed,
                 snr_db = -10 * np.log10(vl)
                 print(f"  iter {it}: val SNR {snr_db:.3f}  best "
                       f"{-10*np.log10(best) if best < 1e8 else float('nan'):.3f}{tag}", flush=True)
-                if (early_stop and prev_ckpt is not None
+                # never stop while taps are still pending: `best` is only recorded
+                # once pruning is complete, so stopping here would save an
+                # unfinished model and report best = -90 dB. Seen on 10 GBaud,
+                # where the val SNR is flat enough to trip the 0.001 dB criterion
+                # mid-pruning (ldbp_p7 stopped with 2 taps left to remove).
+                if (early_stop and not pend and prev_ckpt is not None
                         and abs(snr_db - prev_ckpt) < 0.001):
                     print(f"  early stop at iter {it} (val moved "
                           f"{snr_db - prev_ckpt:+.4f} dB since last checkpoint)", flush=True)
@@ -239,7 +245,14 @@ def _ensure_block(S, nfl):
 
 
 def train_lessfm(S, ns, out, device='cuda', iters=12000, batch=200, P_dbm=None,
-                 lr_len=0.2, lr_nlf=0.002, n_blocks=250, seed=0, nonneg=True, nfl=None):
+                 lr_len=0.02, lr_nlf=0.002, n_blocks=250, seed=0, nonneg=True, nfl=None):
+    """lr_len was 0.2 until 2026-10-06. On 15 x 80 km / 93 GBd that step lets the GVD
+    lengths wander: the single step ends on the wrong side of the link (0.46 / 0.54
+    instead of ~0.53 / 0.47) and at Ns = 15 the operators hop between spans, 18.427 dB
+    against 18.463 for ESSFM with optimised rho. With 0.02 and the geometry.py start
+    point: 18.460, one operator per span ~7 km after the amplifier; single span
+    170 km unchanged within 0.002 dB at Ns = 1..10. The small step needs that start
+    point: from the old one it got stuck at Ns = 10 on 170 km (-0.011 dB)."""
     S = dict(S)
     S['nl_filter_length'] = nlpr_length(S, ns) if nfl is None else nfl
     S = dict(_ensure_block(S, S['nl_filter_length']), nl_filter_length=S['nl_filter_length'])
@@ -256,10 +269,11 @@ def train_essfm(S, ns, out, device='cuda', iters=12000, batch=200, P_dbm=None,
                 lr_rho=0.01, lr_nlf=0.002, n_blocks=250, seed=0, nfl=None, opt_rho=False):
     """ESSFM = the reference single-band method (Civelli "New Twist", Fig.9):
     'CB-ESSFM with Nsb=1 and rho=0.5'. So rho is FIXED at 0.5, NOT optimized -- only
-    the tied NLPR filter is trained. Optimizing rho (opt_rho=True) makes our ESSFM
-    ~0.37 dB too strong vs the paper (Ns=15: 18.46 vs 18.10) and erases the L-ESSFM
-    gain. Verified: rho=0.5 -> 18.095, matching paper 18.10. Set opt_rho=True only to
-    deliberately study the rho-optimized variant."""
+    the tied NLPR filter is trained. Verified: rho=0.5 -> 18.095, matching paper 18.10.
+    opt_rho=True gives the paper's OPTIMISED-rho ESSFM (Fig. 8): 18.46 at Ns=15 on
+    15 x 80 km, i.e. ~0.35 dB over rho=0.5, consistent with the paper's "almost 0.3 dB"
+    and ~1 dB over EDC. It is the benchmark Stella asked for at the 2026-10-06 meeting,
+    not an error."""
     S = dict(S)
     S['nl_filter_length'] = nlpr_length(S, ns, method='essfm') if nfl is None else nfl
     S = dict(_ensure_block(S, S['nl_filter_length']), nl_filter_length=S['nl_filter_length'])

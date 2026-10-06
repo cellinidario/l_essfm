@@ -214,7 +214,12 @@ def forward(S, P):
         fs = (NN - Nch // 2) * S['spacing']
         u_wdm += u[:, NN, :] * np.exp(1j * 2 * np.pi * fs * np.arange(Nsamp_a) / S['fsamp_a'])
     for _ in range(S['Nsp']):
-        u_wdm += np.sqrt(S['sigma2'] / 2) * (np.random.randn(1, Nsamp_a) + 1j * np.random.randn(1, Nsamp_a))
+        # one INDEPENDENT ASE field per polarisation. Drawing (1, Nsamp_a) and
+        # letting it broadcast gave both polarisations the identical noise: the
+        # per-pol power was right but the two were fully correlated, which the
+        # Manakov Kerr term (|u_x|^2 + |u_y|^2) does see.
+        u_wdm += np.sqrt(S['sigma2'] / 2) * (np.random.randn(Npol, Nsamp_a)
+                                             + 1j * np.random.randn(Npol, Nsamp_a))
         for MM in range(S['fw'].model_steps):
             u_wdm = np.fft.ifft(np.fft.fft(u_wdm) * np.exp(1j * S['fw'].get_cd_filter_freq(MM)))
             u_wdm *= np.exp(1j * S['fw'].nl_param[MM] * (np.abs(u_wdm[0, :])**2 + np.abs(u_wdm[1, :])**2))

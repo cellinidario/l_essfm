@@ -30,30 +30,25 @@ from system import build_system, make_bw, SSFMParameters, qam_constellation
 
 
 def _exp_length_mult(S, bw, ns):
-    """Exponential GVD-length init (backward equal-NL power profile), as in TF1.
-    Returns multipliers of the nominal cd_length (sum -> Ns, halved borders).
+    """GVD-length initialisation: the physical equal-nonlinearity split.
 
-    Uses the BACKPROP geometry from `bw` (bw.Nsp, bw.Lsp, bw.StPS) so it is correct
-    for BOTH per-span and total-steps conventions. With total-steps, bw maps the
-    link to bw.Nsp 'spans' of length bw.Lsp with StPS=1 -> the exp profile is built
-    on that geometry (NOT the original S['Nsp']/S['Lsp'], which would mismatch)."""
-    Lsp = bw.Lsp; Nsp = bw.Nsp; sps = bw.StPS
-    alpha_l = S['alpha'] / (10 * np.log10(np.e)) / 1000.0   # 1/m
+    Delegates to core/geometry.py so the initialiser and the convergence check can
+    never drift apart. This replaces an inline version that had two defects, both
+    of which pushed the start point towards UNIFORM steps and left the optimiser a
+    long way from the solution:
 
-    def span_steps(Nstep):
-        z = [0.0]
-        for i in range(1, Nstep):
-            z.append(-np.log(1 - (i / Nstep) * (1 - np.exp(-alpha_l * Lsp))) / alpha_l)
-        z.append(Lsp)
-        return np.diff(z)[::-1]
-    steps_phys = np.concatenate([span_steps(sps) for _ in range(Nsp)])
-    M = bw.model_steps
-    cd_phys = np.zeros(M)
-    cd_phys[0] = steps_phys[0] / 2
-    for i in range(1, M - 1):
-        cd_phys[i] = (steps_phys[i - 1] + steps_phys[i]) / 2
-    cd_phys[M - 1] = steps_phys[-1] / 2
-    return (cd_phys / bw.cd_length).astype(np.float32)
+      * it divided S['alpha'] by 1000 a second time, although build_system already
+        stores dB/m, so the fibre looked 1000x more transparent (effective length
+        21715 km instead of 21.7) and the attenuation over a 170 km span dropped
+        from 7.83 to 0.0078 nepers;
+      * it built the profile on bw's REMAPPED geometry, which for a step count that
+        is not a multiple of the span count invents amplifiers that do not exist
+        (15 spans with 10 steps became 10 fictitious spans of 120 km).
+
+    Returns multipliers of bw.cd_length, borders halved, exactly as before.
+    """
+    from geometry import reference_multipliers
+    return reference_multipliers(S, bw, ns)
 
 
 class LessfmModel(torch.nn.Module):
