@@ -18,31 +18,40 @@ Performance = effective SNR (effSNR, peak over transmit power).
 Complexity = real multiplications per 2D symbol (RM/2D), frequency-domain.
 
 ## Scenarios
+One notebook each; configs in `config/scenario_<name>.ini` (n = 1.125) and `_n2.ini`.
 1. `170km_93GBd`   — single span, 93 GBaud (the OFC/CLEO paper scenario)
 2. `170km_186GBd`  — single span, 186 GBaud
 3. `15x80km_93GBd` — 15-span long-haul, 93 GBaud
+5. `170km_10GBd`   — single span, 10 GBaud
+6. `15x80km_10GBd` — 15-span long-haul, 10 GBaud
+7. `15x80km_32GBd` — 15-span long-haul, 32 GBaud
 
 ## Layout
 ```
-core/        reusable modules (English, self-tested)
-  complexity.py   RM/2D formulas (eval_compl, freq domain; reproduces published arrays)
-  rrc.py          root-raised-cosine filter (analytic frequency form, no 'delay')
-  system.py       build_system / forward / backprop  (TODO)
-  lessfm.py       L-ESSFM & ESSFM training (one parametric file)  (TODO)
-  ldbp.py         LDBP training (FFT-conv)  (TODO)
-  forward.py      generate + cache the received signal once  (TODO)
-config/      one .ini per scenario
-notebooks/   human-readable, runnable end-to-end (RETRAIN flag: load or train)
-  00_tutorial_snr_vs_power.ipynb   SNR vs power + GVD-length / NLPR-filter plots
-  01_170km_93GBd.ipynb             reproduce paper figures (this scenario)
-  02_170km_186GBd.ipynb
-  03_15x80km_93GBd.ipynb
-results/     saved forwards + trained coefficients (so RETRAIN=False is instant)
+functions/
+  scenario.py     Scenario: forward, references, trained models, LDBP, saved results
+  result_plots.py the performance figures (fig1b, fig_vs_steps)
+  system.py       build_system, forward and backward propagation (numpy / CuPy)
+  forward.py      cached forward of a scenario (forward/independent_ase_v1/)
+  forward_sim.py, forward_torch.py   forward on the GPU (generation / training)
+  backprop.py     SNR vs power of EDC, Ideal DBP, OSSFM, L-ESSFM, ESSFM
+  train.py        training of L-ESSFM, ESSFM (PyTorch) and LDBP
+  lessfm_torch.py, ldbp_torch.py, ldbp_eval.py   the trainable models / LDBP evaluation
+  geometry.py     initial L-ESSFM step lengths (NLPR at the nonlinearity quantiles)
+  complexity.py   RM/2D formulas (frequency domain; reproduces the published arrays)
+  rrc.py, storage.py, lib/
+config/      one .ini per scenario and oversampling
+notebooks/   00 tutorial (SNR vs power), 01-07 one per scenario, 04 GVD-length figures
+results/independent_ase_v1/<scenario>/   current results (independent ASE per polarization)
+  <method>[_n2]_Ns<Ns>/parameters.csv     trained coefficients (+ manifest: what they were trained on)
+  evaluations/<method>[_n2]_Ns<Ns>.json   SNR vs power
+  summary.json, fig1b.*, fig_vs_steps.*
+results/<scenario>/                       old results (same ASE on both polarizations)
 ```
 
 ## Key implementation notes (lessons from the reproduction)
 - **Complexity is frequency-domain**: the NLPR filter length Nc does NOT enter
-  ESSFM/L-ESSFM complexity (`core/complexity.py`).  Same band rate R for both
+  ESSFM/L-ESSFM complexity (`functions/complexity.py`).  Same band rate R for both
   oversamplings; n=2 costs ~2x n=1.125 at equal Ns.
 - **ESSFM = L-ESSFM with**: tied NLPR filter (shared across steps) + uniform
   lengths + one optimized splitting ratio rho.  At Ns=1 the two MUST coincide.
@@ -62,7 +71,5 @@ Reorganization in progress.  Core numeric results validated against the MATLAB
 reference (effSNR within ~0.02-0.05 dB across Ns and both oversamplings).
 
 ## Running the notebooks
-Open them from `notebooks/` (Jupyter) or anywhere — the first cell auto-detects
-the project root and adds `core/` to the path, so imports work regardless of the
-launch directory. `RETRAIN=False` loads the shipped coefficients (instant);
-`RETRAIN=True` retrains from scratch.
+Use the `l_essfm_torch` kernel. Saved models and SNR curves are loaded; missing ones
+are trained or computed. `RETRAIN = True` retrains every model.
