@@ -14,8 +14,46 @@ LDBP is a TIME-domain method -> runs at n>=2 (digital oversampling 2).
 The model forward expects the dual-pol signal jointly ([B,Npol,N,2]) so the Kerr
 phase sees total power (the physically-correct, dual-pol objective).
 """
+import os
+
 import numpy as np
 import torch
+
+
+def _kerr_real(yr, nl):
+    """y exp(j nl |y|^2) on the real view [..., 2] of y."""
+    a, b = yr[..., 0], yr[..., 1]
+    ph = (a * a + b * b) * nl
+    c, s = torch.cos(ph), torch.sin(ph)
+    return torch.stack((a * c - b * s, a * s + b * c), -1)
+
+
+_KERR = {}
+
+
+def kerr(yc, nl):
+    """Kerr step yc exp(j nl |yc|^2). On the GPU it is compiled by torch.compile into one
+    kernel for the forward and one for the backward: in complex arithmetic it is ~10
+    kernels per step, and the LDBP training step is bound by the number of kernels, not
+    by the arithmetic. Measured 2026-11-04 inside the CUDA graph of the training step:
+    170 km, 93 GBd, minibatch 50: 5.1 instead of 5.9 ms per iteration; minibatch 200: 8.1
+    instead of 13.1; 186 GBd, minibatch 50: 14.7 instead of 23.8. The values are the same
+    to float rounding. LDBP_COMPILE_KERR=0 keeps the plain version."""
+    if yc.is_cuda not in _KERR:
+        fn = _kerr_real
+        if yc.is_cuda and os.environ.get('LDBP_COMPILE_KERR', '1') != '0':
+            fn = torch.compile(_kerr_real)
+        _KERR[yc.is_cuda] = fn
+    try:
+        out = _KERR[yc.is_cuda](torch.view_as_real(yc), nl)
+    except Exception as e:     # no working compiler: the plain version, same values
+        if _KERR[yc.is_cuda] is _kerr_real:
+            raise
+        print(f'  torch.compile of the Kerr step failed ({type(e).__name__}); running it '
+              'uncompiled', flush=True)
+        _KERR[yc.is_cuda] = _kerr_real
+        out = _kerr_real(torch.view_as_real(yc), nl)
+    return torch.view_as_complex(out)
 
 
 _FIR_OBJ = {}
@@ -187,10 +225,12 @@ class LdbpModel(torch.nn.Module):
         """y: [B, Npol, N, 2] (dual-pol jointly). Returns equalized complex [B,Npol,N].
         single_pol=True -> Kerr uses per-polarization power (NOT the dual-pol sum), to
         match the TF1 single-pol training; the eval (ldbp_eval) uses total power."""
-        H = self._filters_freq()
+        # unbind, not H[NN]: the backward of each H[NN] writes a whole [M, N] gradient, so
+        # the step cost grew with M^2 N (15 x 80 km, 93 GBd, 300 steps: 209 ms of the
+        # training iteration, 2026-11-04); unbind stacks the M step gradients once.
+        H = self._filters_freq().unbind(0)
         yc = torch.complex(y[..., 0], y[..., 1])                # [B,Npol,N]
         for NN in range(self.M):
             yc = torch.fft.ifft(torch.fft.fft(yc) * H[NN])                # CD-FIR
-            ysq = yc.real ** 2 + yc.imag ** 2
-            yc = yc * torch.exp(1j * (ysq * self.nl[NN]))               # scalar Kerr
+            yc = kerr(yc, self.nl[NN])                                    # scalar Kerr
         return yc

@@ -165,7 +165,9 @@ class LessfmModel(torch.nn.Module):
         # once: a training iteration is launch-bound (the GPU was busy ~13% of the time),
         # and building them inside the step loop cost ~12 extra kernels per step per
         # microbatch. Same maths as _nlf_padded_fft; gradients agree to ~1e-7.
-        E, H = self._step_factors()
+        # unbind, not E[NN] / H[NN]: their backward writes a whole [M, N] gradient per
+        # step (cost ~M^2 N); unbind stacks the step gradients once (see ldbp_torch).
+        E, H = (t.unbind(0) for t in self._step_factors())
         yc = torch.complex(y[..., 0], y[..., 1])
         for NN in range(self.M):
             yc = torch.fft.ifft(torch.fft.fft(yc) * E[NN])

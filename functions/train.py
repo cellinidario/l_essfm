@@ -156,13 +156,30 @@ def warn_if_gpu_shared():
 # across all Ns sharing the same block size. Cuts sc03 data-gen from ~30 regens to
 # ~2 (one per distinct block size: 1024 and the doubled 2048).
 _FWD_CACHE = {}
+TRAINING_DATA_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), '..', 'forward',
+                                  'training_blocks')
+
+
 def train_forward(tf, S, n_blocks, P_dbm, seed):
-    """Cache by complete forward identity, exact power, seeds and device."""
+    """Cache by complete forward identity, exact power, seeds and device; also kept on
+    disk in forward/training_blocks/ (git-ignored), since 2000 LDBP blocks of the
+    15 x 80 km link take 30-60 min to generate and are the same in every process."""
     key = (forward_identity(S), float(P_dbm), n_blocks, seed, str(tf.dev))
     if key not in _FWD_CACHE:
-        ys, xs, P = gen_dualpol(tf, S, n_blocks, P_dbm, seed)
-        yv, xv, _ = gen_dualpol(tf, S, max(8, n_blocks // 8), P_dbm, seed + 10000)
-        _FWD_CACHE[key] = (ys, xs, yv, xv, P)
+        # forward_identity leaves out how the forward is integrated: name it as well
+        name = (f"{key[0][:16]}_{S['StPS_fw']}{S['step_method_fw'][:3]}{S['ssfm_method_fw'][:3]}"
+                f"_P{key[1]:+.6g}_blocks{n_blocks}_seed{seed}.pt")
+        path = os.path.join(TRAINING_DATA_DIR, name)
+        if os.path.exists(path):
+            saved = torch.load(path, map_location=tf.dev)
+            _FWD_CACHE[key] = (saved['ys'], saved['xs'], saved['yv'], saved['xv'], saved['P'])
+        else:
+            ys, xs, P = gen_dualpol(tf, S, n_blocks, P_dbm, seed)
+            yv, xv, _ = gen_dualpol(tf, S, max(8, n_blocks // 8), P_dbm, seed + 10000)
+            _FWD_CACHE[key] = (ys, xs, yv, xv, P)
+            os.makedirs(TRAINING_DATA_DIR, exist_ok=True)
+            torch.save(dict(ys=ys, xs=xs, yv=yv, xv=xv, P=P, identity=key[0]), path + '.tmp')
+            os.replace(path + '.tmp', path)
     return _FWD_CACHE[key]
 
 
@@ -173,10 +190,24 @@ def clear_forward_cache():
 
 EARLY_STOP_DB = 0.002        # see _train_loop docstring
 EARLY_STOP_CHECKS = 1
+# schedule='plateau' (2026-11-03): constant learning rate, divided by 10 when the best
+# validation SNR has not improved by PLATEAU_MIN_DB for PLATEAU_PATIENCE iterations, and
+# stop at the next such stall. With the cosine schedule the learning rate reaches zero at
+# the end of the budget, so the validation flattens there whether or not the model has
+# converged (L-ESSFM, 15 x 80 km, 10 GBd, Ns = 10: +0.10 dB with a 5x budget).
+# Patience chosen 2026-11-04 against brute-force references (no early stop, 60k-300k
+# iterations): L-ESSFM/ESSFM 2000 matches them (10 and 32 GBd, <= 0.0003 dB); LDBP has a
+# long slow tail and needs 10000 (170 km, 93 GBd, [11, 9]: 0.022 dB below the 300k
+# value with minibatch 50; 0.07 dB with 5000, 0.14 dB with 2000).
+PLATEAU_MIN_DB = 0.002
+PLATEAU_PATIENCE = 2000
+LDBP_PLATEAU_PATIENCE = 10000
+PLATEAU_DROPS = 1
 
 
 def _train_loop(model, S, tf, param_groups, iters, batch, P_dbm, n_blocks, seed,
-                ldbp=False, device='cuda', prune_events=None, early_stop=True, data=None):
+                ldbp=False, device='cuda', prune_events=None, early_stop=True, data=None,
+                schedule='cosine', patience=None):
     """prune_events: optional list of (iteration, step_index) -- at the given iteration,
     remove ONE outermost tap from that step (model.prune_one). Mirrors ldbp_diag.py:
     gradual one-tap-at-a-time pruning so the model adapts between prunes (pruning many
@@ -194,7 +225,10 @@ def _train_loop(model, S, tf, param_groups, iters, batch, P_dbm, n_blocks, seed,
     and save a model with more taps than the target. On the
     measured logs: flat ESSFM stops early (was burning hours, e.g. 16602s with best
     frozen since iter 1000), while the slow steady LDBP tail (+0.007..0.03 dB/1000)
-    is never cut."""
+    is never cut.
+    schedule: 'cosine' (default, the learning rate is annealed to zero over iters) or
+    'plateau' (constant learning rate, see PLATEAU_*; iters is then only a cap).
+    patience: iterations without a PLATEAU_MIN_DB gain (default PLATEAU_PATIENCE)."""
     if iters < 1:
         raise ValueError('iters must be positive')
     if data is not None:
@@ -228,7 +262,7 @@ def _train_loop(model, S, tf, param_groups, iters, batch, P_dbm, n_blocks, seed,
         for g in param_groups:
             g['lr'] = torch.tensor(float(g['lr']), device=device)
     opt = torch.optim.Adam(param_groups, capturable=use_graph)
-    sch = torch.optim.lr_scheduler.CosineAnnealingLR(opt, T_max=iters)
+    sch = torch.optim.lr_scheduler.CosineAnnealingLR(opt, T_max=iters) if schedule == 'cosine' else None
     static_idx = torch.zeros(batch, dtype=torch.long, device=device)
     static_loss = torch.zeros((), device=device)
 
@@ -286,7 +320,8 @@ def _train_loop(model, S, tf, param_groups, iters, batch, P_dbm, n_blocks, seed,
                 for g, lr in zip(param_groups, initial_learning_rates):
                     g['lr'] = lr
                 opt = torch.optim.Adam(param_groups)
-                sch = torch.optim.lr_scheduler.CosineAnnealingLR(opt, T_max=iters)
+                sch = (torch.optim.lr_scheduler.CosineAnnealingLR(opt, T_max=iters)
+                       if schedule == 'cosine' else None)
                 break
     best, bstate = 1e9, None
     prev_ckpt = None                           # val SNR [dB] at the previous checkpoint
@@ -303,6 +338,9 @@ def _train_loop(model, S, tf, param_groups, iters, batch, P_dbm, n_blocks, seed,
     if not pend:
         best = initial_loss
         bstate = {k: v.detach().clone() for k, v in model.state_dict().items()}
+    ref_db, last_gain, drops = None, 0, PLATEAU_DROPS     # schedule='plateau'
+    patience = PLATEAU_PATIENCE if patience is None else patience
+    stop_reason = 'iteration_budget'
     t0 = time.time()
     for it in range(iters):
         while pend and it >= pend[0][0]:
@@ -313,7 +351,8 @@ def _train_loop(model, S, tf, param_groups, iters, batch, P_dbm, n_blocks, seed,
             graph.replay()
         else:
             train_step()
-        sch.step()
+        if sch is not None:
+            sch.step()
         loss = static_loss
         if it % 200 == 0 or it == iters - 1:
             with torch.no_grad():
@@ -340,9 +379,29 @@ def _train_loop(model, S, tf, param_groups, iters, batch, P_dbm, n_blocks, seed,
                     stable_checkpoints += 1
                 else:
                     stable_checkpoints = 0
-                if early_stop and stable_checkpoints >= EARLY_STOP_CHECKS:
+                if schedule == 'plateau':
+                    if not pend:
+                        best_db = -10 * np.log10(best)
+                        if ref_db is None or best_db > ref_db + PLATEAU_MIN_DB:
+                            ref_db, last_gain = best_db, it
+                        elif it - last_gain >= patience:
+                            if drops == 0:
+                                print(f"  stop at iter {it}: best val SNR {best_db:.3f} dB, no gain of "
+                                      f"{PLATEAU_MIN_DB} dB in {patience} iterations", flush=True)
+                                stop_reason = 'validation_plateau'
+                                break
+                            drops -= 1
+                            last_gain = it
+                            for g in param_groups:
+                                if torch.is_tensor(g['lr']):
+                                    g['lr'].mul_(.1)
+                                else:
+                                    g['lr'] *= .1
+                            print(f"  iter {it}: learning rate divided by 10", flush=True)
+                elif early_stop and stable_checkpoints >= EARLY_STOP_CHECKS:
                     print(f"  early stop at iter {it} (val moved "
                           f"less than {EARLY_STOP_DB} dB since the previous checkpoint; not a global-convergence certificate)", flush=True)
+                    stop_reason = 'validation_plateau'
                     break
                 prev_ckpt = snr_db
     if bstate is not None:
@@ -353,8 +412,9 @@ def _train_loop(model, S, tf, param_groups, iters, batch, P_dbm, n_blocks, seed,
         'n_blocks': n_blocks, 'batch': batch, 'requested_iterations': iters,
         'microbatch': microbatch, 'cuda_graph': graph is not None,
         'initial_learning_rates': initial_learning_rates,
-        'completed_iterations': it + 1, 'best_validation_mse': best,
-        'stop_reason': 'validation_plateau' if it + 1 < iters else 'iteration_budget',
+        'completed_iterations': it + 1, 'best_validation_mse': best, 'schedule': schedule,
+        'patience': patience if schedule == 'plateau' else None,
+        'stop_reason': stop_reason,
         'history': history}
     passes = -(-batch // microbatch)
     print(f"  trained in {time.time()-t0:.0f}s ({1e3*(time.time()-t0)/(it+1):.0f} ms/iteration, "
@@ -440,7 +500,8 @@ def _ensure_block(S, nfl):
 
 
 def train_lessfm(S, ns, out, device='cuda', iters=12000, batch=200, P_dbm=None,
-                 lr_len=0.02, lr_nlf=0.002, n_blocks=250, seed=0, nonneg=True, nfl=None):
+                 lr_len=0.02, lr_nlf=0.002, n_blocks=250, seed=0, nonneg=True, nfl=None,
+                 schedule='cosine'):
     # Keep the reduced length learning rate introduced on 2026-10-06.
     S = dict(S)
     S['nl_filter_length'] = nlpr_length(S, ns) if nfl is None else nfl
@@ -449,7 +510,8 @@ def train_lessfm(S, ns, out, device='cuda', iters=12000, batch=200, P_dbm=None,
     m = LessfmModel(S, ns, device, nonneg=nonneg).to(device)
     groups = [{'params': [m.length], 'lr': lr_len}, {'params': [m.nlf], 'lr': lr_nlf}]
     data = train_forward(tf, S, n_blocks, _power(S, P_dbm), seed)
-    _train_loop(m, S, tf, groups, iters, batch, _power(S, P_dbm), n_blocks, seed, data=data, device=device)
+    _train_loop(m, S, tf, groups, iters, batch, _power(S, P_dbm), n_blocks, seed, data=data,
+                device=device, schedule=schedule)
     m.training_record.update(method='lessfm',ns=ns,nfl=S['nl_filter_length'],
         nonnegative_lengths=bool(nonneg),
         initialization='equal_area_quantile',
@@ -459,7 +521,8 @@ def train_lessfm(S, ns, out, device='cuda', iters=12000, batch=200, P_dbm=None,
 
 
 def train_essfm(S, ns, out, device='cuda', iters=12000, batch=200, P_dbm=None,
-                lr_rho=0.01, lr_nlf=0.002, n_blocks=250, seed=0, nfl=None, opt_rho=False):
+                lr_rho=0.01, lr_nlf=0.002, n_blocks=250, seed=0, nfl=None, opt_rho=False,
+                schedule='cosine'):
     """Train tied-filter ESSFM. Set opt_rho=True for the optimized benchmark.
 
     The historical default retains the separately labelled fixed-rho=0.5 curve.
@@ -476,7 +539,8 @@ def train_essfm(S, ns, out, device='cuda', iters=12000, batch=200, P_dbm=None,
     if opt_rho:
         groups.insert(0, {'params': [m.rho], 'lr': lr_rho})
     data = train_forward(tf, S, n_blocks, _power(S, P_dbm), seed)
-    _train_loop(m, S, tf, groups, iters, batch, _power(S, P_dbm), n_blocks, seed, data=data, device=device)
+    _train_loop(m, S, tf, groups, iters, batch, _power(S, P_dbm), n_blocks, seed, data=data,
+                device=device, schedule=schedule)
     m.training_record.update(method='essfm',ns=ns,nfl=S['nl_filter_length'],
                             optimized_rho=bool(opt_rho),rho=float(m.rho.detach().cpu()))
     save_params(out, m); print(f"  saved {out} (nfl={S['nl_filter_length']}, "
@@ -491,14 +555,17 @@ def _tile_targets(pattern, M):
 
 def train_ldbp(S, ns, out, cd_lengths, device='cuda', iters=15000, batch=100, P_dbm=None,
                lr=5e-4, n_blocks=2000, seed=0, init_cd=None, init_nl=None, total_steps=False,
-               target_taps=None, n_prune_stages=8, single_pol=False, fir_bandwidth=1.0):
+               target_taps=None, n_prune_stages=8, single_pol=False, fir_bandwidth=1.0,
+               schedule='cosine', prune_iters=None):
     """LDBP trainer with GRADUAL PRUNING (the working recipe, see memory
     ldbp-pruning-variable-taps): init with abundant cd_lengths taps, then prune the
     CD-FIRs progressively DURING training down to target_taps. target_taps is a
     per-step PATTERN (e.g. [11,9]) tiled across steps -- a single uniform value
     degenerates at 93 GBaud; a variable pattern reaches low average complexity.
     Use a logarithmic-step config for best results.
-    fir_bandwidth: share of the band the LS-CO init is fitted on (ldbp_torch._fir_obj)."""
+    fir_bandwidth: share of the band the LS-CO init is fitted on (ldbp_torch._fir_obj).
+    prune_iters: iterations the pruning schedule is spread over (default: iters); with
+    schedule='plateau', iters is only a cap, so the schedule needs its own length."""
     from ldbp_torch import LdbpModel
     S_train = dict(S)
     S_train['Npol'] = 1  # LDBP is single-pol; train on single-pol to avoid XPM noise floor
@@ -531,12 +598,16 @@ def train_ldbp(S, ns, out, cd_lengths, device='cuda', iters=15000, batch=100, P_
         _random.Random(seed).shuffle(order)
         K = len(order)
         if K > 0:
-            pruning_schedule = np.ceil(np.ceil(2.0**(-np.arange(K, 0, -1)) * iters))
-            pruning_schedule = np.ceil(pruning_schedule + np.arange(K) * iters / 8 / K)
+            span = prune_iters or iters
+            pruning_schedule = np.ceil(np.ceil(2.0**(-np.arange(K, 0, -1)) * span))
+            pruning_schedule = np.ceil(pruning_schedule + np.arange(K) * span / 8 / K)
             sched = np.clip(pruning_schedule, 0, iters - 1).astype(int)
             prune_events = list(zip(sched.tolist(), order))
+    # the same blocks _train_loop would generate, cached for the next LDBP of this process
+    data = train_forward(tf, S_train, n_blocks, _power(S, P_dbm), seed)
     _train_loop(m, S_train, tf, groups, iters, batch, _power(S, P_dbm), n_blocks, seed,
-                ldbp=True, prune_events=prune_events, device=device)
+                ldbp=True, prune_events=prune_events, device=device, schedule=schedule,
+                data=data, patience=LDBP_PLATEAU_PATIENCE)
     m.training_record['fir_bandwidth'] = m.fir_bandwidth
     _save_ldbp(out, m); print(f"  saved {out}")
     return m

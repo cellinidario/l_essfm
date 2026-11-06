@@ -31,6 +31,9 @@ ROOT = Path(__file__).resolve().parents[1]
 RESULT_SET = 'independent_ase_v1'
 # Part of every model manifest: changing it marks all models as trained differently.
 TRAINING_VERSION = 'seeded-low-lr-quantile-v2'
+PLATEAU_CAP = 300000   # iteration cap of schedule='plateau' (it stops on the validation)
+LDBP_PLATEAU_BLOCKS = 2000   # LDBP training blocks with schedule='plateau' (cosine: 200)
+LDBP_PLATEAU_BATCH = 50      # single-span LDBP minibatch with 'plateau' (Haeger; cosine: 100)
 # Forward launch powers [dBm], 0.1 dB apart, around each scenario's optimum.
 POWER_GRIDS = {
     'scenario_170km_93GBd': (8.5, 10.5),
@@ -44,7 +47,10 @@ TRAINED_METHODS = ('lessfm', 'essfm', 'essfm_optrho')
 # LDBP split step. 'asymmetric' (Hager's 25 x 80 km case): N_st filters for N_st Kerr
 # steps, models in ldbp_asym_<tag>/. 'symmetric': one more filter, a final linear
 # half-step without Kerr; models in ldbp_<tag>/ (and results/<scenario>/ldbp_<tag>/).
-LDBP_SPLIT_STEP = 'asymmetric'
+# Symmetric since 2026-11-05 (Dario), as Hager at 32 GBd; with the plateau schedule it
+# matched the asymmetric SSFM within 0.013 dB at equal taps (scratchpad sym_test.py). The
+# complexity still counts N_st filters: the final half-step merges with the matched filter.
+LDBP_SPLIT_STEP = 'symmetric'
 
 
 def _suffix(nos):
@@ -53,13 +59,24 @@ def _suffix(nos):
 
 class Scenario:
 
-    def __init__(self, name, retrain=False, nfl_mode='formula', training_power_dbm=None):
+    def __init__(self, name, retrain=False, nfl_mode='formula', training_power_dbm=None,
+                 schedule='cosine', ldbp_schedule='cosine'):
         """name: e.g. 'scenario_170km_93GBd' (config/<name>.ini and <name>_n2.ini).
         nfl_mode: L-ESSFM NLPR length, 'formula' (shrinks with Ns, as ESSFM) or
         'ns1' (the Ns = 1 length for every Ns).
-        training_power_dbm: training power, if not the config's 'training power [dBm]'."""
+        training_power_dbm: training power, if not the config's 'training power [dBm]'.
+        schedule: L-ESSFM/ESSFM training, 'cosine' (12000 iterations, the learning rate
+        annealed to zero) or 'plateau' (constant learning rate until the validation stops
+        improving, train.PLATEAU_*). The cosine budget stops short of convergence at 10
+        and 32 GBd (2026-11-03: +0.10 and +0.03 dB with 5x the iterations).
+        ldbp_schedule: the same for LDBP; with 'plateau' the pruning is spread over the
+        notebook's iterations and the training continues until the validation stops
+        improving, on LDBP_PLATEAU_BLOCKS blocks. The cosine budget leaves LDBP far from
+        convergence (2026-11-03: 170 km, 93 GBd, [11, 9]: 18.57 dB, 19.08 at 150k)."""
         self.name = name
         self.retrain = retrain
+        self.schedule = schedule
+        self.ldbp_schedule = ldbp_schedule
         self.nfl_mode = nfl_mode
         self.training_power_dbm = training_power_dbm
         self.configs = {nos: ROOT / 'config' / f'{name}{_suffix(nos)}.ini' for nos in (1.125, 2.)}
@@ -125,6 +142,8 @@ class Scenario:
                         forward_version=FORWARD_VERSION, ase_mode='independent',
                         nfl_mode=self.nfl_mode, seed=seed, training_version=TRAINING_VERSION,
                         training_power_dbm=S['train_power_dbm'])
+        if self.schedule != 'cosine':     # cosine models keep their original identity
+            identity['schedule'] = self.schedule
         if path.exists() and not self.retrain:
             if not manifest.exists():
                 raise ValueError(f'{path} has no manifest: it was not trained by this code. '
@@ -137,12 +156,16 @@ class Scenario:
         print(f'Training {tag}, n={nos:g}, Ns={ns}', flush=True)
         if tag == 'lessfm':
             nfl = train.nlpr_length(S, 1) if self.nfl_mode == 'ns1' else None
-            train.train_lessfm(S, ns, str(path), iters=iters, seed=seed, nfl=nfl)
+            train.train_lessfm(S, ns, str(path), iters=self._iters(iters), seed=seed, nfl=nfl,
+                               schedule=self.schedule)
         else:
-            train.train_essfm(S, ns, str(path), iters=iters, seed=seed,
-                              opt_rho=(tag == 'essfm_optrho'))
+            train.train_essfm(S, ns, str(path), iters=self._iters(iters), seed=seed,
+                              opt_rho=(tag == 'essfm_optrho'), schedule=self.schedule)
         write_json(manifest, dict(identity=identity, sha256=digest(path)))
         return str(path)
+
+    def _iters(self, iters):
+        return iters if self.schedule == 'cosine' else max(iters, PLATEAU_CAP)
 
     def diagnostics(self, nos, ns, tag='lessfm'):
         """Geometry report of a trained L-ESSFM, saved next to it (.geometry.json).
@@ -220,14 +243,25 @@ class Scenario:
                 path = legacy
             else:
                 print(f'LDBP {tag}: the old model is not finite; training a new one', flush=True)
+        record = Path(str(path) + '.json')
+        if path.exists() and not self.retrain and self.ldbp_schedule != 'cosine' and (
+                not record.exists()
+                or json.loads(record.read_text()).get('schedule', 'cosine') != self.ldbp_schedule):
+            raise ValueError(f'{path} was trained with another schedule. '
+                             'Move it away, or set RETRAIN = True.')
         if self.retrain or not path.exists():
             with exclusive(self.resdir / '.locks' / f'{name}.lock'):
                 St = build_system(self.training_config(2., ldbp=True))
                 M = make_bw(St, steps_per_span, total_steps=False).model_steps
-                train.train_ldbp(St, steps_per_span, str(path), [init_taps] * M, iters=iters,
+                plateau = self.ldbp_schedule == 'plateau'
+                train.train_ldbp(St, steps_per_span, str(path), [init_taps] * M,
+                                 iters=max(iters, PLATEAU_CAP) if plateau else iters,
                                  P_dbm=power_dbm, lr=lr or (1e-3 if iters == 20000 else 5e-4),
-                                 batch=8 if St['Nsp'] > 1 else 100, n_blocks=200,
-                                 target_taps=targets, total_steps=False)
+                                 batch=8 if St['Nsp'] > 1 else LDBP_PLATEAU_BATCH if plateau else 100,
+                                 n_blocks=LDBP_PLATEAU_BLOCKS if plateau else 200,
+                                 target_taps=targets, total_steps=False,
+                                 schedule=self.ldbp_schedule,
+                                 prune_iters=iters if plateau else None)
         cd, nl = load_ldbp_params(str(path), bw.model_steps)
         taps = [len(cd[i]) for i in range(bw.model_steps)]
         steps = bw.model_steps if asymmetric else bw.model_steps - 1   # Kerr steps, N_st
@@ -237,6 +271,8 @@ class Scenario:
                         config_sha256=digest(self.configs[2.]),
                         backward_steps_per_span=steps_per_span, step_method='logarithmic',
                         powers_dbm=self.powers.tolist())
+        if self.ldbp_schedule != 'cosine':   # cosine records keep their original identity
+            identity['schedule'] = self.ldbp_schedule
         if asymmetric:   # symmetric records keep their original identity
             identity['split_step'] = 'asymmetric'
         record = self._saved(name, identity)
